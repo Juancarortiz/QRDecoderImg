@@ -3,10 +3,12 @@ package com.sybven.qrdecoder;
 import com.google.zxing.*;
 import com.google.zxing.client.j2se.BufferedImageLuminanceSource;
 import com.google.zxing.common.HybridBinarizer;
-import org.json.JSONException;
+import com.google.zxing.multi.qrcode.QRCodeMultiReader;
 import org.json.JSONObject;
 
 import javax.imageio.ImageIO;
+import java.awt.Graphics2D;
+import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -16,100 +18,91 @@ import java.util.EnumMap;
 import java.util.Map;
 
 public final class Decoder {
-    private static final MultiFormatReader reader = initReader();
+    private static final QRCodeMultiReader multiReader = new QRCodeMultiReader();
 
-    private Decoder() {
-        throw new UnsupportedOperationException("Esta es una clase de utilidad y no puede ser instanciada");
-    }
+    private Decoder() {}
 
-    /**
-     * Decodifica una imagen en formato Base64 para encontrar un código QR.
-     *
-     * @param base64Image La cadena de la imagen en formato Base64.
-     * @return Una cadena JSON con el resultado de la operación.
-     */
     public static String decode(String base64Image) {
-        if (base64Image == null || base64Image.isEmpty()) {
-            return errorResponse(400, "No se recibió ninguna imagen.");
+        if (base64Image == null || base64Image.trim().isEmpty()) {
+            return errorResponse(400, "No se recibió imagen.");
         }
 
         try {
-            BufferedImage image = decodeBase64ToImage(base64Image);
+            String cleanBase64 = base64Image.contains(",") ? base64Image.split(",")[1] : base64Image;
+            cleanBase64 = cleanBase64.replaceAll("\\s", "");
+            byte[] imageBytes = Base64.getDecoder().decode(cleanBase64);
+            BufferedImage originalImage = ImageIO.read(new ByteArrayInputStream(imageBytes));
 
-            if (image == null) {
-                return errorResponse(400, "No se pudo decodificar la cadena Base64 a una imagen.");
+            if (originalImage == null) return errorResponse(400, "Imagen inválida.");
+
+            Result result = tryDecode(originalImage);
+
+            if (result == null) {
+                result = tryDecode(upscaleImage(originalImage, 2.0));
             }
 
-            Result result = decodeQRCode(image);
-            return successResponse(result.getText());
+            if (result == null) {
+                BufferedImage gray = new BufferedImage(originalImage.getWidth(), originalImage.getHeight(), BufferedImage.TYPE_BYTE_GRAY);
+                Graphics2D g = gray.createGraphics();
+                g.drawImage(originalImage, 0, 0, null);
+                g.dispose();
+                result = tryDecode(upscaleImage(gray, 1.5));
+            }
 
-        } catch (IllegalArgumentException e) {
-            return errorResponse(400, "El formato de la imagen no es válido.");
-        } catch (NotFoundException e) {
-            return errorResponse(404, "Código QR no encontrado en la imagen.");
-        } catch (IOException e) {
-            return errorResponse(400, "Error al leer los datos de la imagen.");
-        } catch (ReaderException e) {
-            return errorResponse(400, "Código QR dañado o ilegible.");
+            if (result != null) {
+                return successResponse(result.getText());
+            } else {
+                return errorResponse(404, "QR no detectado.");
+            }
+
         } catch (Exception e) {
-            return errorResponse(500, "Error inesperado: " + e.getMessage());
+            return errorResponse(500, "Error: " + e.getMessage());
         }
     }
 
-    /**
-     * Convierte una cadena Base64 en un objeto BufferedImage.
-     * Usa java.util.Base64 y javax.imageio.ImageIO.
-     */
-    private static BufferedImage decodeBase64ToImage(String base64Image) throws IOException, IllegalArgumentException {
-        byte[] imageBytes = Base64.getDecoder().decode(base64Image);
-        return ImageIO.read(new ByteArrayInputStream(imageBytes));
+    private static Result tryDecode(BufferedImage img) {
+        try {
+            LuminanceSource source = new BufferedImageLuminanceSource(img);
+            BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(source));
+            Map<DecodeHintType, Object> hints = new EnumMap<>(DecodeHintType.class);
+            hints.put(DecodeHintType.TRY_HARDER, Boolean.TRUE);
+            hints.put(DecodeHintType.POSSIBLE_FORMATS, Collections.singletonList(BarcodeFormat.QR_CODE));
+
+            Result[] results = multiReader.decodeMultiple(bitmap, hints);
+            if (results != null && results.length > 0) {
+                Result best = results[0];
+                for (Result r : results) {
+                    if (r.getText().length() > best.getText().length()) best = r;
+                }
+                return best;
+            }
+        } catch (Exception ignored) {}
+        return null;
     }
 
-    /**
-     * Decodifica el QR desde un objeto BufferedImage.
-     * Usa la clase de ayuda BufferedImageLuminanceSource de la librería ZXing.
-     */
-    private static Result decodeQRCode(BufferedImage image) throws ReaderException {
-        LuminanceSource source = new BufferedImageLuminanceSource(image);
-        BinaryBitmap binaryBitmap = new BinaryBitmap(new HybridBinarizer(source));
-        return reader.decode(binaryBitmap);
-    }
-
-    private static MultiFormatReader initReader() {
-        Map<DecodeHintType, Object> hints = new EnumMap<>(DecodeHintType.class);
-        hints.put(DecodeHintType.TRY_HARDER, Boolean.TRUE);
-        hints.put(DecodeHintType.POSSIBLE_FORMATS, Collections.singletonList(BarcodeFormat.QR_CODE));
-        MultiFormatReader r = new MultiFormatReader();
-        r.setHints(hints);
-        return r;
+    private static BufferedImage upscaleImage(BufferedImage src, double factor) {
+        int w = (int) (src.getWidth() * factor);
+        int h = (int) (src.getHeight() * factor);
+        BufferedImage zoomed = new BufferedImage(w, h, src.getType() == 0 ? BufferedImage.TYPE_INT_ARGB : src.getType());
+        Graphics2D g = zoomed.createGraphics();
+        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+        g.drawImage(src, 0, 0, w, h, null);
+        g.dispose();
+        return zoomed;
     }
 
     private static String successResponse(String data) {
-        return createJsonResponse(200, "Código QR decodificado con éxito", data).toString();
+        JSONObject json = new JSONObject();
+        json.put("code", "200");
+        json.put("message", "Código QR decodificado con éxito");
+        json.put("data", data);
+        return json.toString();
     }
 
-    private static String errorResponse(int code, String message) {
-        return createJsonResponse(code, message, null).toString();
-    }
-
-    private static JSONObject createJsonResponse(int code, String message, String data) {
-        JSONObject jsonResponse = new JSONObject();
-        try {
-            jsonResponse.put("code", code);
-            jsonResponse.put("message", message);
-            if (data != null) {
-                jsonResponse.put("data", data);
-            }
-        } catch (JSONException e) {
-            try {
-                JSONObject errorJson = new JSONObject();
-                errorJson.put("code", 500);
-                errorJson.put("message", "Error interno al generar la respuesta JSON.");
-                return errorJson;
-            } catch (JSONException je) {
-                return new JSONObject();
-            }
-        }
-        return jsonResponse;
+    private static String errorResponse(int code, String msg) {
+        JSONObject json = new JSONObject();
+        json.put("code", String.valueOf(code));
+        json.put("message", msg);
+        return json.toString();
     }
 }
